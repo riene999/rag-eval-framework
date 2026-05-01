@@ -1,23 +1,35 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import json
+import os
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 from statistics import mean
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agentic_eval.agents import CaseGeneratorAgent, DiagnosisAgent, EvaluationAgent
+from agentic_eval.agents.pipeline import EvalPipeline
 from agentic_eval.clients import HttpTargetAgentClient, MockTargetAgentClient
 from agentic_eval.reports import ReportGenerator
 from agentic_eval.schemas.result_schema import EvaluationResult
 
 try:
+    import yaml
+except ImportError:
+    yaml = None
+
+try:
     from rich.console import Console
     from rich.panel import Panel
-    from rich.progress import track
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
     from rich.table import Table
 
     console = Console()
@@ -29,59 +41,226 @@ except ImportError:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the agentic RAG/Agent evaluation pipeline.")
-    parser.add_argument("--mock", action="store_true", help="Use the built-in mock target client.")
-    parser.add_argument("--base-url", help="Base URL for the external target service.")
-    parser.add_argument("--endpoint", default="/ask", help="Target ask endpoint. Defaults to /ask.")
-    parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout in seconds.")
-    parser.add_argument("--case-file", help="JSONL file containing evaluation cases.")
-    parser.add_argument("--docs-dir", default="examples/sample_docs", help="Directory of Markdown docs for generated cases.")
-    parser.add_argument("--generated-case-file", default="outputs/generated_cases.jsonl", help="Where generated cases are saved.")
-    parser.add_argument("--output-dir", default="outputs", help="Directory for reports.")
-    parser.add_argument("--top-k", type=int, default=5, help="Retrieval top_k for target calls and metrics.")
-    parser.add_argument("--max-cases", type=int, default=5, help="Maximum generated cases when no case file is provided.")
+    parser.add_argument("--config", default="config.yaml", help="Path to the evaluation config YAML file.")
     return parser.parse_args()
 
 
 def main() -> int:
-    # 确定client->确定case_generator->确定evaluator->诊断结果->生成报告
     args = parse_args()
-    if args.mock:
-        client = MockTargetAgentClient()
-    elif args.base_url:
-        client = HttpTargetAgentClient(args.base_url, endpoint=args.endpoint, timeout=args.timeout)
-    else:
-        print_error("Error: provide either --mock or --base-url.")
+    try:
+        config = load_config(args.config)
+    except Exception as exc:
+        print_error(f"Error loading config: {exc}")
         return 2
 
-    case_generator = CaseGeneratorAgent(args.docs_dir)
-    # 如果提供了文件，则从文件加载测试用例，否则自行生成测试用例
-    if args.case_file:
-        cases = case_generator.load_cases(args.case_file)
-    else:
-        cases = case_generator.generate_cases(max_cases=args.max_cases)
-        case_generator.save_cases(cases, args.generated_case_file)
-
-    evaluator = EvaluationAgent(client, top_k=args.top_k)
-    diagnosis = DiagnosisAgent()
-    reporter = ReportGenerator(args.output_dir)
-
-    try:
-        results: list[EvaluationResult] = []
-        case_iterable = (
-            track(cases, description="Evaluating cases", transient=False)
-            if RICH_AVAILABLE
-            else cases
+    target_config = config["target"]
+    if bool(target_config["mock"]):
+        if target_config["base_url"]:
+            print_info("target.mock=true, so target.base_url is ignored.")
+        client = MockTargetAgentClient()
+        target_mode = "mock"
+    elif target_config["base_url"]:
+        client = HttpTargetAgentClient(
+            target_config["base_url"],
+            endpoint=target_config["endpoint"],
+            timeout=int(target_config["timeout"]),
         )
-        for case in case_iterable:
-            results.append(evaluator.evaluate_case(case))
-        diagnosis.diagnose_all(results)
+        target_mode = f"http {client.url}"
+    else:
+        print_error("Error: set target.mock=true or target.base_url in config.yaml.")
+        return 2
+
+    case_config = config["cases"]
+    case_generator = CaseGeneratorAgent(case_config["docs_dir"])
+    if case_config["case_file"]:
+        cases = case_generator.load_cases(case_config["case_file"])
+    else:
+        cases = case_generator.generate_cases(max_cases=int(case_config["max_cases"]))
+        case_generator.save_cases(cases, case_config["generated_case_file"])
+
+    evaluation_config = config["evaluation"]
+    diagnosis_config = config["diagnosis"]
+    llm_config = diagnosis_config["llm"]
+
+    evaluator = EvaluationAgent(client, top_k=int(evaluation_config["top_k"]))
+    diagnosis = DiagnosisAgent(
+        latency_threshold_ms=int(diagnosis_config["latency_threshold_ms"]),
+        use_llm=bool(diagnosis_config["use_llm"]),
+        llm_model=llm_config["model"],
+        llm_api_key=resolve_api_key(llm_config),
+        llm_base_url=llm_config["base_url"],
+        llm_timeout=int(llm_config["timeout"]),
+    )
+    run_id = make_run_id()
+    base_output_dir = Path(config["report"]["output_dir"])
+    run_output_dir = base_output_dir / run_id
+    reporter = ReportGenerator(run_output_dir)
+    print_info(
+        f"run_id={run_id}; loaded {len(cases)} cases; target={target_mode}; "
+        f"diagnosis_llm={bool(diagnosis_config['use_llm'])}."
+    )
+
+    concurrency = int(evaluation_config.get("concurrency", 1))
+    llm_failed_only = bool(diagnosis_config["llm_failed_only"])
+
+    pipeline = EvalPipeline(
+        evaluator=evaluator,
+        diagnoser=diagnosis,
+        eval_workers=concurrency,
+        diagnosis_workers=max(1, concurrency // 2),
+        llm_failed_only=llm_failed_only,
+    )
+
+    started_at = datetime.now()
+    try:
+        if RICH_AVAILABLE and console is not None:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as prog:
+                eval_task = prog.add_task(f"Evaluating ×{concurrency}", total=len(cases))
+                diag_task = prog.add_task("Diagnosing", total=len(cases))
+
+                results: list[EvaluationResult] = pipeline.run_with_progress(
+                    cases,
+                    on_eval_done=lambda __: prog.advance(eval_task),
+                    on_diagnosis_done=lambda __: prog.advance(diag_task),
+                )
+        else:
+            results = pipeline.run(cases)
+
         artifacts = reporter.generate(results)
+        finished_at = datetime.now()
+        save_run_meta(
+            run_output_dir, base_output_dir, run_id,
+            started_at, finished_at, results, config, target_mode, concurrency,
+        )
     except Exception as exc:
         print_error(f"Evaluation failed: {exc}")
         return 1
 
     print_run_summary(results, artifacts)
     return 0
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to read config.yaml. Install dependencies with pip install -r requirements.txt.")
+
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"{config_path} does not exist.")
+
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError("Top-level config must be a YAML mapping.")
+    return merge_dicts(default_config(), loaded)
+
+
+def default_config() -> dict[str, Any]:
+    return {
+        "target": {
+            "mock": True,
+            "base_url": None,
+            "endpoint": "/ask",
+            "timeout": 60,
+        },
+        "cases": {
+            "case_file": None,
+            "docs_dir": "examples/sample_docs",
+            "generated_case_file": "outputs/generated_cases.jsonl",
+            "max_cases": 5,
+        },
+        "evaluation": {
+            "top_k": 5,
+            "concurrency": 1,
+        },
+        "diagnosis": {
+            "use_llm": False,
+            "llm_failed_only": True,
+            "latency_threshold_ms": 5000,
+            "llm": {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "base_url": "https://api.deepseek.com",
+                "api_key": None,
+                "api_key_env": "DS_API_KEY",
+                "timeout": 60,
+            },
+        },
+        "report": {
+            "output_dir": "outputs",
+        },
+    }
+
+
+def merge_dicts(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def make_run_id() -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{ts}_{uuid.uuid4().hex[:6]}"
+
+
+def redact_config(config: dict[str, Any]) -> dict[str, Any]:
+    snapshot = copy.deepcopy(config)
+    llm = snapshot.get("diagnosis", {}).get("llm", {})
+    if llm.get("api_key"):
+        llm["api_key"] = "[redacted]"
+    return snapshot
+
+
+def save_run_meta(
+    run_output_dir: Path,
+    base_output_dir: Path,
+    run_id: str,
+    started_at: datetime,
+    finished_at: datetime,
+    results: list[EvaluationResult],
+    config: dict[str, Any],
+    target_mode: str,
+    concurrency: int,
+) -> None:
+    total = len(results)
+    passed = sum(1 for r in results if r.passed)
+    meta = {
+        "run_id": run_id,
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "finished_at": finished_at.isoformat(timespec="seconds"),
+        "duration_s": round((finished_at - started_at).total_seconds(), 1),
+        "target": target_mode,
+        "concurrency": concurrency,
+        "total_cases": total,
+        "passed": passed,
+        "pass_rate": round(passed / total, 4) if total else 0.0,
+        "config_snapshot": redact_config(config),
+    }
+    (run_output_dir / "run_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (base_output_dir / "latest_run_id.txt").write_text(run_id, encoding="utf-8")
+
+
+def resolve_api_key(llm_config: dict[str, Any]) -> str | None:
+    api_key = llm_config.get("api_key")
+    if api_key:
+        return str(api_key)
+    api_key_env = llm_config.get("api_key_env")
+    if api_key_env:
+        return os.getenv(str(api_key_env))
+    return None
+
 
 
 def print_error(message: str) -> None:
@@ -91,8 +270,14 @@ def print_error(message: str) -> None:
         print(message, file=sys.stderr)
 
 
+def print_info(message: str) -> None:
+    if RICH_AVAILABLE and console is not None:
+        console.print(f"[cyan]{message}[/cyan]")
+    else:
+        print(message)
+
+
 def print_run_summary(results: list[EvaluationResult], artifacts: dict[str, str | None]) -> None:
-    # 根据EvaluationResult通过RICH_CLI创建结果表格
     total = len(results)
     passed = sum(1 for result in results if result.passed)
     pass_rate = passed / total if total else 0.0
@@ -152,13 +337,11 @@ def print_run_summary(results: list[EvaluationResult], artifacts: dict[str, str 
 
 
 def avg_metric(results: list[EvaluationResult], metric: str) -> float:
-    # 返回指定指标的默认值
     values = [float(result.metrics.get(metric, 0.0)) for result in results]
     return mean(values) if values else 0.0
 
 
 def latency_percentile(results: list[EvaluationResult], percentile: int) -> float:
-    # 返回延迟的指定百分位数
     values = sorted(latency_values(results))
     if not values:
         return 0.0
@@ -167,7 +350,6 @@ def latency_percentile(results: list[EvaluationResult], percentile: int) -> floa
 
 
 def latency_values(results: list[EvaluationResult]) -> list[float]:
-    # 收集每个案例的延迟，优先选择目标延迟而非客户端延迟
     values: list[float] = []
     for result in results:
         latency = result.metrics.get("latency_ms")

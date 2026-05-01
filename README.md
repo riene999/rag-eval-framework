@@ -1,107 +1,42 @@
 # agentic-eval-framework
 
-`agentic-eval-framework` is a standalone evaluation framework for external RAG and Agent systems. It does not implement a RAG system itself. Instead, it generates evaluation cases, calls a target system through a unified HTTP API, computes retrieval and generation metrics, diagnoses failures, and produces reports.
+`agentic-eval-framework` 是一个独立于被测系统的 RAG/Agent 自动化评测框架。它不实现任何 RAG 功能，而是通过 HTTP API 对外部 RAG/Agent 服务进行黑盒评测：生成测试用例、调用目标系统、计算检索与生成指标、归因失败原因、输出报告。
 
-## Architecture
+## 架构
 
-```text
-Sample Docs / Case File
-        |
-        v
-CaseGeneratorAgent
-        |
-        v
-EvaluationAgent ---> TargetAgentClient ---> External RAG/Agent HTTP API
-        |
-        v
-DiagnosisAgent
-        |
-        v
-ReportGenerator ---> Markdown + JSON + optional chart
-```
-
-The target system can be `paper-rag-agent` or any other RAG/Agent service, as long as it exposes the expected HTTP API. This project never imports or copies code from the target project.
-
-## Agent Responsibilities
-
-- `CaseGeneratorAgent`: loads existing JSONL cases or generates rule-based test cases from Markdown documents.
-- `EvaluationAgent`: calls the target RAG/Agent system and computes retrieval, generation, and task-level metrics.
-- `DiagnosisAgent`: analyzes failed cases and returns root cause, failed stage, priority, and optimization suggestions.
-
-## Install
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-On macOS/Linux, activate with:
-
-```bash
-source .venv/bin/activate
-```
-
-## Run With Mock Target
-
-The mock client lets you run the full demo without any external RAG service:
-
-```bash
-python scripts/test_target_client.py --mock --question "What does the API return?"
-python scripts/run_eval.py --mock
-```
-
-You can also use the prepared cases:
-
-```bash
-python scripts/run_eval.py --mock --case-file examples/sample_cases.jsonl
-```
-
-## Connect an External RAG Service
-
-Start your target service, then run:
-
-```bash
-python scripts/test_target_client.py --base-url http://localhost:8000 --question "How should errors be returned?"
-python scripts/run_eval.py --base-url http://localhost:8000 --case-file examples/sample_cases.jsonl --output-dir outputs
-```
-
-By default, the framework sends `POST /ask`. See [docs/target_agent_api.md](docs/target_agent_api.md) for the full contract.
-
-For a Chinese step-by-step integration manual for the external RAG/Agent project, see [docs/external_rag_integration_guide.md](docs/external_rag_integration_guide.md).
-
-## Example Output
-
-After an evaluation run, check:
-
-- `outputs/eval_report.md`: Markdown summary with pass rate, metrics, bad case table, and suggestions.
-- `outputs/eval_results.json`: machine-readable results.
-- `outputs/failure_distribution.png`: failure distribution chart, generated when `matplotlib` is installed and failures exist.
-
-Console summary example:
+框架由三个 Agent 和一个报告模块组成，通过 `EvalPipeline` 以队列化流水线方式协作运行。`EvaluationAgent` 完成单条用例后立刻将结果推入消息队列，`DiagnosisAgent` 无需等待全部评测完成即可并发消费，eval 与 diagnosis 在时间上重叠执行。
 
 ```text
-Total cases: 5
-Passed: 3
-Pass rate: 60.00%
-Markdown report: outputs/eval_report.md
-JSON report: outputs/eval_results.json
+用例文件 / 文档目录
+        │
+        ▼
+CaseGeneratorAgent          生成或加载 JSONL 评测用例
+        │
+        ▼
+EvalPipeline ──────────────────────────────────────────────
+│                                                          │
+│  eval_queue        diagnosis_queue       done_queue      │
+│  ┌─────────┐      ┌──────────────┐      ┌──────────┐    │
+│  │ eval×N  │─────▶│  diag×M     │─────▶│ collect  │    │
+│  └─────────┘      └──────────────┘      └──────────┘    │
+│       │                                                  │
+│       ▼                                                  │
+│  TargetAgentClient ──▶ 外部 RAG/Agent HTTP API           │
+└──────────────────────────────────────────────────────────┘
+        │
+        ▼
+ReportGenerator             输出 Markdown / JSON / 失败分布图
 ```
 
-## Highlights
+**各模块职责：**
 
-- Multi-agent evaluation pipeline with separated case generation, execution, diagnosis, and reporting.
-- Decoupled target client interface, supporting both HTTP services and local mock runs.
-- Retrieval quality metrics: Recall@k, MRR, retrieved count.
-- Generation quality metrics: keyword recall, answer length, citation consistency, latency.
-- Rule-based diagnosis for retrieval, generation, citation, and latency failures.
-- Lightweight dependencies and plain Python modules.
-- Rich-enhanced CLI with progress display, summary tables, failed-case tables, and pretty target responses.
+- `CaseGeneratorAgent`：从 JSONL 文件加载用例，或从 Markdown 文档生成模板用例
+- `EvaluationAgent`：调用目标系统，计算 Recall@k、MRR、多源覆盖率、关键词召回、答案 F1、引用一致性、p95 延迟等指标
+- `DiagnosisAgent`：对失败用例进行规则归因（检索/生成/引用/延迟），可选接入 LLM 生成根因分析与优化建议
+- `EvalPipeline`：以生产者-消费者队列将上述 Agent 串联为并发流水线，eval worker 与 diagnosis worker 独立线程运行
 
-## Extension Ideas
+## 执行
 
-- Add LLM-based case generation and diagnosis.
-- Add faithfulness, answer relevance, and context precision metrics.
-- Support batch HTTP APIs and async target clients.
-- Add dataset adapters for public RAG benchmarks.
-- Add richer report artifacts such as HTML dashboards or trend comparisons.
+```bash
+python scripts/run_eval.py
+```

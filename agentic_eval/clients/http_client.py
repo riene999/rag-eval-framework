@@ -20,6 +20,7 @@ class HttpTargetAgentClient(TargetAgentClient):
         self.base_url = base_url.rstrip("/") + "/"
         self.endpoint = endpoint.lstrip("/")
         self.timeout = timeout
+        self._session = requests.Session()
 
     @property
     def url(self) -> str:
@@ -31,7 +32,7 @@ class HttpTargetAgentClient(TargetAgentClient):
 
         start = time.perf_counter()
         try:
-            response = requests.post(self.url, json=payload, timeout=self.timeout)
+            response = self._session.post(self.url, json=payload, timeout=self.timeout)
             client_latency_ms = int((time.perf_counter() - start) * 1000)
         except requests.RequestException as exc:
             raise TargetAgentHTTPError(f"Request failed for {self.url}: {exc}") from exc

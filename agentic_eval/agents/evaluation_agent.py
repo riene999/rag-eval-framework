@@ -56,7 +56,7 @@ class EvaluationAgent:
                 error_type="target_error",
             )
 
-        # 通过TargetAgentResponse的回复生成标准response->计算指标metrics->metrics被包含在EvaluationResult中
+        # 通过TargetAgentResponse的回复生成标准response->计算指标metrics->metrics被包含在EvaluationResult中返回
         response = TargetAgentResponse.from_dict(raw_response)
         metrics = {
             **compute_retrieval_metrics(case.gold_evidence, response.retrieved_chunks, k=self.top_k),
@@ -80,5 +80,3 @@ class EvaluationAgent:
             error_type=infer_error_type(metrics, passed),
         )
 
-    def evaluate_cases(self, cases: list[EvaluationCase]) -> list[EvaluationResult]:
-        return [self.evaluate_case(case) for case in cases]

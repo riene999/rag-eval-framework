@@ -11,6 +11,10 @@
 
 ## Components
 
+## Configuration
+
+`scripts/run_eval.py` reads runtime settings from `config.yaml` by default. The only CLI option is `--config`, which points to an alternate YAML file. The config covers target client selection, case loading or generation, evaluation metrics, diagnosis model settings, and report output paths.
+
 ## CaseGeneratorAgent
 
 Generates or loads `EvaluationCase` objects. The current implementation supports JSONL loading and rule-based case generation from Markdown sample docs. Future versions can add LLM-based generation or benchmark adapters.
@@ -21,7 +25,7 @@ Calls a `TargetAgentClient`, normalizes the returned response, computes metrics,
 
 ## DiagnosisAgent
 
-Uses explicit rules to classify bad cases into retrieval, generation, citation, latency, or unknown failures.
+Uses explicit rules to classify bad cases into retrieval, generation, citation, latency, or unknown failures by default. It can optionally call an OpenAI-compatible chat completions endpoint for LLM-based diagnosis. The default YAML config is set up for DeepSeek with `base_url: https://api.deepseek.com` and `api_key_env: DEEPSEEK_API_KEY`. The rule diagnosis is always computed first and passed to the LLM as a baseline; if the LLM call fails or no API key is configured, the agent falls back to the rule diagnosis and records the LLM error in the diagnosis payload.
 
 ## TargetAgentClient
 

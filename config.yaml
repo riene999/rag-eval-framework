@@ -1,0 +1,29 @@
+target:
+  mock: false
+  base_url: http://localhost:8011
+  endpoint: /ask
+  timeout: 60
+
+cases:
+  case_file: examples/academic_rag_cases.jsonl
+  docs_dir: examples/sample_docs
+  generated_case_file: outputs/generated_cases.jsonl
+  max_cases: 5
+
+evaluation:
+  top_k: 5
+  concurrency: 4
+
+diagnosis:
+  use_llm: true
+  llm_failed_only: true
+  latency_threshold_ms: 5000
+  llm:
+    provider: deepseek
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com
+    api_key_env: DS_API_KEY
+    timeout: 60
+
+report:
+  output_dir: outputs
